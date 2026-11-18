@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+._*
+
+# Build products (make app)
+Wakey.app/
+.build/
+.cache/
+*.dSYM
+
+# Generated icon — `make icon` (or `make app`) rebuilds it from tools/make-icon.swift
+Resources/AppIcon.icns
+Resources/AppIcon.iconset/
+
+# Firmware build output — recreate with ./firmware/build.sh
+# firmware/stock/*.bin is deliberately NOT ignored: it is the known-good restore image.
+firmware/builds/
+
+# Editors / tooling
+.vscode/
+.idea/
+*.xcuserstate
+xcuserdata/
+.swiftpm/
+
+# Logs
+*.log
