@@ -192,15 +192,17 @@ feature `0x0005` and then returns zero bytes for every index, in short and long 
 panel therefore shows receiver identity, slot, battery-feature index, the live sensor line, and offers
 a **Rescan** that walks all six slots (a chooser appears if more than one answers).
 
-**Build note:** `make app` drives `swiftc` directly. SwiftPM's build system needs to write outside
-the workspace and wraps itself in `sandbox-exec`, which fails under the harness sandbox. `Package.swift`
-is kept so you can open the folder in Xcode; `make app` is the supported path here.
+**Build note:** `make app` drives `swiftc` directly, signs with the installed Apple Development
+identity when there is one, and replaces `/Applications/Wakey.app` on every build; there is no
+compile-only target. SwiftPM's build system needs to write outside the workspace and wraps itself in
+`sandbox-exec`, which fails under the harness sandbox. `Package.swift` is kept so you can open the
+folder in Xcode; `make app` is the supported path here.
 
 **Layout**
 
 ```
 wakey-wakey/
-├── Makefile                       # `make app` → Wakey.app, ad-hoc signed
+├── Makefile                       # `make app` → builds, signs, installs /Applications/Wakey.app
 ├── Package.swift                  # for opening in Xcode (see note)
 ├── Sources/Wakey/
 │   ├── WakeyMain.swift            # @main, LSUIElement, headless --blank/--wake/--status/--sensor/--selftest
@@ -239,7 +241,7 @@ IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFSt
 
 **Login item:** `SMAppService.mainApp.register()` (macOS 13+). Requires the app to live at a stable path — `/Applications/Wakey.app` or `~/Applications`. LaunchAgent plist as fallback if `SMAppService` complains about an ad-hoc-signed dev build.
 
-**Cost:** ~600 lines of Swift, no third-party packages, ~0.2 % CPU (one 7-byte poll every 2 s), no network.
+**Cost:** ~1,400 lines of Swift, no third-party packages, ~0.2 % CPU (one 7-byte poll every 2 s), plus one LAN WebSocket to the TV.
 
 ---
 
@@ -252,6 +254,9 @@ IOPMAssertionCreateWithName(kIOPMAssertionTypePreventUserIdleSystemSleep as CFSt
 | **M2** ✅ running | `HIDPPClient` + `DockSensor`, logging only by default | Sensor live now; watching for false transitions over the next day |
 | **M3** ✅ opt-in | Sensor → display control behind an **off-by-default** toggle, with stand-down override | Flip “Automate while charging”, dock, walk away, come back |
 | **M4** ✅ | Settings panel, login item (SMAppService + LaunchAgent fallback), generated icon, About, first-run panel, single-instance guard | Built and self-tested; toggle “Start Wakey at login” once you've installed it |
+| **M5** ✅ | LG TV over webOS: volume, mute, OLED light, panel off/on, standby, sleep/wake, optional media keys | Volume, mute, OLED light and panel/wake verified on the C4; full power-off is opt-in and awaits Wake on LAN |
+| **M6** ✅ | Keyboard macro keys: the four PlayStation keys (F13–F16) plus the microphone key (F17) send recorded shortcuts, e.g. Teams mute ⇧⌘M | Built; uses the same Accessibility grant as TV media keys |
+| **M7** ✅ | System-wide key remapping through macOS `hidutil`: any keyboard-page key to any other key (Caps Lock → Escape/Control, …) | Built; applies to all keyboards while Wakey runs, no TCC permission |
 
 M0 and M1 are the risky ones and they're both cheap. M2 is elapsed time, not work.
 
@@ -299,8 +304,10 @@ M0 and M1 are the risky ones and they're both cheap. M2 is elapsed time, not wor
 
 ### M4 — what was added
 
-- **Settings panel** (menu → Settings…, or first launch): automation, keep-awake, start-at-login,
-  manual blank/wake, reveal log, plus the 5-minute lock-delay note.
+- **Settings panel** (menu → Settings…, or first launch), laid out like System Settings: a
+  source-list sidebar for **General**, **Menu Bar**, **Login**, **Receiver**, **Keyboard**, **TV**
+  and **Advanced**, and a detail pane of grouped cards. A search field filters the sidebar; the
+  window is resizable and scrolls the detail pane when needed.
 - **Start at login** via `SMAppService.mainApp`, falling back to a `~/Library/LaunchAgents` plist when
   ServiceManagement refuses — which it does for an ad-hoc-signed app outside `/Applications`. Both
   outcomes are logged, and the checkbox reflects the real status, including
@@ -314,3 +321,77 @@ M0 and M1 are the risky ones and they're both cheap. M2 is elapsed time, not wor
 
 Behaviour over days rather than minutes: watch `HEARTBEAT` lines for a rising `failures=N`, and confirm
 no spurious blank/wake pairs appear.
+
+
+---
+
+## 9. TV control (M5) — measured 2026-11-19
+
+The LG on HDMI is an **OLED42C41LA** (webOS 24). Everything below was measured on this set, not
+copied from a spec sheet.
+
+### What the firmware actually does
+
+| Fact | Consequence |
+|---|---|
+| `ws://<ip>:3000` resets immediately; `wss://<ip>:3001` completes the upgrade | only the TLS port is usable; the socket needs a trust delegate for LG's self-signed leaf |
+| Registration needs `pairingType: "PROMPT"`; the key is returned only after the on-screen prompt | first use is interactive, later launches are silent |
+| A manifest without `CONTROL_AUDIO` gets `401 insufficient permissions` for `audio/getVolume` | ship the full permission set (`LAUNCH`, `CONTROL_AUDIO`, `CONTROL_POWER`, `READ_INPUT_DEVICE_LIST`, …) |
+| `ssap://settings/getSystemSettings` returns `backlight: "90"` | OLED light is readable |
+| `ssap://settings/setSystemSettings` returns `401` even with `WRITE_SETTINGS` | direct write is dead on this firmware |
+| An alert with `onclose` = `luna://com.webos.settingsservice/setSystemSettings`, then `closeAlert`, changes the value | the alert/luna bridge is the working write path |
+| `turnOffScreen` → `Screen Off`; `turnOnScreen` works from that state | panel-off is instant and keeps the network + HDMI sink |
+| `turnOnScreen` while already `Active` returns `500 Application error` | treat it as already on, not as a failure |
+| `system/turnOff` → `Power Off`; the network stack stays up for a while | a socket can connect while the panel is still dark — the power state, not the socket, is the truth |
+| `connectionmanager/getinfo` returns `wifiInfo.macAddress` and `wiredInfo.macAddress` | Wake-on-LAN can address both interfaces |
+| WOL to both MACs, 15 s after `system/turnOff`, brought the set back over Ethernet (2026-11-19 21:08) | full power-off is viable on a wired connection; Wi-Fi remains untested |
+| Default output device is `LG TV SSCR2` and `set volume` reports *missing value* | macOS cannot change HDMI volume; the TV API is the only volume control |
+
+### Design
+
+`TVController.swift` owns one `URLSessionWebSocketTask`, a request id table with timeouts, and a
+state machine (`off → connecting → pairing/ready → unreachable`). The client key and the pinned
+certificate fingerprint live in `~/Library/Application Support/Wakey/tv.json` (0600), not UserDefaults.
+Registration retries once without a stale key.
+
+Sleep semantics are deliberately split:
+
+- **panel off** (default) on display sleep — instant, keeps the HDMI sink, so macOS does not reflow
+  windows; wake is a single `turnOnScreen`.
+- **full standby** (opt-in) on system sleep — needs the TV's *Mobile TV On → Turn on via Wi-Fi*
+  (or *Support → IP Control Settings → Wake on LAN*). Wake-on-LAN is sent to both MACs on every
+  broadcast interface, on ports 9 and 7, and the wake path polls `getPowerState` instead of trusting
+  the socket: a standby TV accepts TCP while its panel is still off.
+- The TV is only touched while `getForegroundAppInfo` reports this Mac's input (`com.webos.app.hdmi2`).
+  A TV showing broadcast content is never blanked or powered off.
+
+Media keys are a separate opt-in (`TVMediaKeys.swift`): a `.cgSessionEventTap` for
+`NX_SYSDEFINED`, key codes 0/1/7 (volume up/down/mute) and 2/3 (brightness up/down). Volume is
+intercepted only when CoreAudio's default output name contains “LG TV”; brightness only when
+`NSScreen.main` is the TV. The tap consumes both key edges so macOS does not also show its own HUD.
+It needs Accessibility. `make app` signs with an installed Apple Development identity when one is
+available, which keeps that grant across rebuilds; the ad-hoc fallback still resets it each time.
+
+The four PlayStation keys emit F13–F16 and the microphone key emits F17 after the firmware remap
+(`KeyMacros.swift`). Carbon hotkeys register those globally and post the shortcut recorded for that
+key (settings → Keyboard → Macro keys); registering the hotkey needs no Input Monitoring, but posting
+the replacement needs Accessibility. Mapping a shortcut to “Teams mute” (⇧⌘M) is the reference case.
+The settings rows show the physical key symbols (○ △ □ ✕ and a microphone) so the mapping is obvious.
+
+System-wide key remapping lives in **Settings → Remapping** and uses `hidutil`'s `UserKeyMapping`
+rather than an event tap: any keyboard-page key can become any other key (Caps Lock → Escape or
+Control, etc.). It applies to every connected keyboard while Wakey runs, needs no TCC permission, and
+is cleared on quit. Media keys and Fn are outside that page; arbitrary key→shortcut targets remain in
+the macro-key layer.
+
+### Open risks
+
+1. **Wake-on-LAN** — verified over Ethernet with the wired MAC (`00:A1:59:27:CA:7F`): the set went
+   to `Power Off`, the magic packet was sent 15 s later, and the panel came back. The Wi-Fi path
+   (`44:27:45:83:92:28`) is still unverified — an AP that drops broadcast, or “Mobile TV On” being
+   off, would strand a fully powered-off set. That is why panel-off remains the default.
+2. **Certificate rotation** — the fingerprint is pinned. A firmware change that replaces the LG leaf
+   makes Wakey refuse the connection until “forget pairing” is used.
+3. **Firmware drift** — the luna alert trick is a hack; a future webOS may close it.
+4. **Accessibility reset** — with ad-hoc signing every rebuild needs the switch flipped again. The
+   Makefile now prefers an Apple Development identity so this only affects ad-hoc-only machines.

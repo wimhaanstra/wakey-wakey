@@ -39,6 +39,30 @@ interoperability reference. We captured its WebHID traffic and read its publishe
 which interface the keyboard actually speaks (raw HID on `0xFF60`) and to establish that it has no
 keyboard battery command. No Launcher code is included or adapted here.
 
+## LG webOS
+
+**[openRemote](https://github.com/Harshsanket/open-remote)** by Harsh Sanket — MIT. A native Swift
+menu-bar remote; its `WebOS.swift` and `registration.json` were the clearest reference for the
+`wss://<ip>:3001` socket, the certificate pinning shape and the permission list a modern TV expects.
+No openRemote code is included.
+
+**[bscpylgtv](https://github.com/chros73/bscpylgtv)** by chros — MIT. The authority on the
+settings-service workaround: webOS rejects `setSystemSettings` over SSAP, so picture values are
+written by creating an alert whose `onclose` handler is a `luna://com.webos.settingsservice/...` call
+and immediately closing it. Also the source for the `turnOffScreen`/`turnOnScreen` endpoints and the
+`connectionmanager/getinfo` MAC addresses.
+
+**[m1ddc](https://github.com/waydabber/m1ddc)** by waydabber — MIT. The optional DDC/CI client Wakey
+shells out to for the second LG monitor's brightness; its `IOAVService` approach is what makes DDC work
+on Apple Silicon at all.
+
+**[lgtv2](https://github.com/hobbyquaker/lgtv2)** by Sebastian Raff — MIT. The registration manifest
+and permission names, the observation that the LG leaf certificate is shared across models, and the
+"TV reacts only on the interface it uses, so send both MACs" behaviour.
+
+**[Home Assistant's `webostv` integration](https://www.home-assistant.io/integrations/webostv/)** —
+Apache-2.0. Behavioural reference for power-state handling and Wake-on-LAN setup.
+
 ## Tooling
 
 QMK's build system, the Arm GNU Toolchain, `dfu-util` and `iconutil`; Apple's IOHID, SF Symbols and

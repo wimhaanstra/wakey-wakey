@@ -40,6 +40,11 @@ _ = IOHIDDeviceOpen(device, IOOptionBits(kIOHIDOptionsTypeNone))
 print("listening \(Int(seconds)) s for 0xA4 battery pushes… (keyboard must be on 2.4 GHz)")
 
 let deadline = Date().addingTimeInterval(seconds)
+func timeStamp() -> String {
+    let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+    return f.string(from: Date())
+}
+let started = Date()
 var seen = 0
 while Date() < deadline {
     RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.1))
@@ -53,7 +58,16 @@ while Date() < deadline {
             let charging = report[4]
             let transport = report[5]
             let state = charging == 0 ? "not charging" : (charging == 1 ? "charging" : "full")
-            print(String(format: "0xA4  %3d%%  %4d mV  %@  transport=0x%02x", percent, millivolts, state, transport))
+            print(String(format: "%@ t+%3.0fs  0xA4  %3d%%  %4d mV  %@  transport=0x%02x",
+                         timeStamp(), Date().timeIntervalSince(started), percent, millivolts, state, transport))
+        } else if report[0] == 0xA6, report.count > 6 {
+            // wakey_debug_push: idle timeout + live state machine, pushed over 2.4 GHz
+            let idle = Int(report[1]) | Int(report[2]) << 8
+            let keyEvents = Int(report[7]) | Int(report[8]) << 8
+            print(String(format: "%@ t+%3.0fs  0xA6  idle=%3ds  sinceKey=%3ds  matrixEnabled=%d  dimmedByUs=%d  transport=0x%02x  keyEvents=%d  lastKey=0x%02x  sleepPath=%d  lpmPath=%d  drvOff=%d",
+                         timeStamp(), Date().timeIntervalSince(started),
+                         idle, Int(report[3]), Int(report[4]), Int(report[5]), Int(report[6]),
+                         keyEvents, Int(report[9]), Int(report[10]), Int(report[11]), Int(report[12])))
         } else if seen == 0 {
             print("(other report: \(hx(Array(report.prefix(12)))))")
         }

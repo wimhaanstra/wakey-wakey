@@ -30,5 +30,14 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>Wakey</string>
+	<key>NSAccessibilityUsageDescription</key>
+	<string>Wakey uses Accessibility to turn the Mac's volume and brightness keys into TV and monitor controls.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Wakey talks to your LG TV on the local network to control its volume, brightness and power.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 </dict>
 </plist>

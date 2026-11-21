@@ -62,8 +62,12 @@ enum WakeyMain {
             print("settings window: \(settingsTitle) — \(settings.layoutReport())")
             let diagnostics = DiagnosticsWindowController()
             print("diagnostics window: \(diagnostics.window?.title ?? "nil") — \(diagnostics.layoutReport())")
+            let scanner = TVScannerWindowController()
+            print("scanner window: \(scanner.window?.title ?? "nil") — \(scanner.layoutReport())")
             let missing = DeviceIcons.missingSymbols()
             print("menu icons: \(missing.isEmpty ? "all symbols present" : "MISSING \(missing)")")
+            let missingSettings = SettingsStyle.missingSymbols()
+            print("settings icons: \(missingSettings.isEmpty ? "all symbols present" : "MISSING \(missingSettings)")")
             print("mouse icon: \(DeviceIcons.mouse(charging: true, colored: true) != nil ? "ok" : "nil")  keyboard icon: \(DeviceIcons.keyboard(charging: true, colored: true) != nil ? "ok" : "nil")")
             let status = DeviceIcons.statusBar(mouse: (percent: 76, charging: false),
                                                keyboard: (percent: 75, charging: true),
@@ -83,7 +87,12 @@ enum WakeyMain {
             exit(0)
         }
 
-        // Refuse to run twice: a second copy would fight the first over the HID++ interface.
+        if args.contains(where: { $0.hasPrefix("--tv") }) {
+            runTVCommand(args)
+            return
+        }
+
+    // Refuse to run twice: a second copy would fight the first over the HID++ interface.
         let me = ProcessInfo.processInfo.processIdentifier
         if let bundleID = Bundle.main.bundleIdentifier,
            let existing = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
@@ -99,4 +108,112 @@ enum WakeyMain {
         app.setActivationPolicy(.accessory)
         app.run()
     }
+
+    /// Headless TV control, used to verify the protocol without the menu bar app.
+    /// Every command waits for the socket to register (the first one shows the TV prompt).
+    private static func runTVCommand(_ args: [String]) {
+        if let index = args.firstIndex(of: "--tv-host"), args.count > index + 1 {
+            Preferences.shared.tvHost = args[index + 1]
+        }
+
+        let commands = ["status", "pair", "volume", "mute", "backlight", "screen", "power", "detect"]
+        let command = commands.first { args.contains("--tv-\($0)") } ?? "status"
+        var value: String?
+        if let index = args.firstIndex(of: "--tv-\(command)"), args.count > index + 1 {
+            value = args[index + 1]
+        }
+
+        if command == "detect" {
+            TVController.discover { devices in
+                if devices.isEmpty {
+                    print("no LG TV answered SSDP")
+                }
+                for device in devices {
+                    print("\(device.host)  \(device.name ?? "?")  \(device.model ?? "?")")
+                }
+                exit(devices.isEmpty ? 1 : 0)
+            }
+            RunLoop.main.run(until: Date().addingTimeInterval(8))
+            print("discovery timed out")
+            exit(1)
+        }
+
+        guard !Preferences.shared.tvHost.isEmpty else {
+            print("no TV address configured — pass --tv-host <ip> or set it in Settings")
+            exit(1)
+        }
+        Preferences.shared.tvControl = true
+
+        print("TV: host \(Preferences.shared.tvHost), command \(command)")
+        let tv = TVController()
+        var performed = false
+        var sawReady = false
+        let immediatePowerOn = command == "power" && (value ?? "off") == "on"
+
+        if immediatePowerOn {
+            tv.onSnapshot = { snapshot in
+                if snapshot.powerState == "Active" {
+                    print("TV snapshot: model=\(snapshot.model ?? "?") power=\(snapshot.powerState ?? "?") "
+                          + "volume=\(snapshot.volume.map(String.init) ?? "?") "
+                          + "backlight=\(snapshot.backlight.map(String.init) ?? "?") "
+                          + "app=\(snapshot.currentApp ?? "?")")
+                    exit(0)
+                }
+            }
+        }
+
+        tv.onStateChange = { state in
+            print("TV: state \(state.rawValue)")
+            guard state == .ready else { return }
+            sawReady = true
+            guard !immediatePowerOn, !performed else { return }
+            performed = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                switch command {
+                case "volume":
+                    tv.setVolume(Int(value ?? "20") ?? 20)
+                case "mute":
+                    tv.setMute((value ?? "on") == "on")
+                case "backlight":
+                    tv.setBacklight(Int(value ?? "50") ?? 50)
+                case "screen":
+                    (value ?? "off") == "off" ? tv.screenOff() : tv.screenOn()
+                case "power":
+                    (value ?? "off") == "off" ? tv.powerOff() : tv.powerOn()
+                case "pair":
+                    break
+                default:
+                    break
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                    let snapshot = tv.snapshot
+                    print("TV snapshot: model=\(snapshot.model ?? "?") power=\(snapshot.powerState ?? "?") "
+                          + "volume=\(snapshot.volume.map(String.init) ?? "?") "
+                          + "backlight=\(snapshot.backlight.map(String.init) ?? "?") "
+                          + "app=\(snapshot.currentApp ?? "?")")
+                    if command == "power" && (value ?? "off") == "off" { exit(0) }
+                    if command == "pair" { exit(0) }
+                    if command == "screen" || command == "volume" || command == "mute"
+                        || command == "backlight" || command == "status" || command == "power" {
+                        exit(0)
+                    }
+                }
+            }
+        }
+
+        if command == "pair" {
+            tv.forgetPairing()
+        } else if immediatePowerOn {
+            tv.start()
+            tv.powerOn()
+        } else {
+            tv.start()
+        }
+
+        let wait: TimeInterval = (command == "status" || command == "pair") ? 120 : 45
+        RunLoop.main.run(until: Date().addingTimeInterval(wait))
+        print("timed out (ready=\(sawReady))")
+        exit(1)
+    }
+
 }

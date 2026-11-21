@@ -1,0 +1,489 @@
+diff --git a/keyboards/keychron/common/keychron_raw_hid.c b/keyboards/keychron/common/keychron_raw_hid.c
+index b3657af..80c5125 100644
+--- a/keyboards/keychron/common/keychron_raw_hid.c
++++ b/keyboards/keychron/common/keychron_raw_hid.c
+@@ -18,6 +18,7 @@
+ #include "keychron_common.h"
+ #include "keychron_raw_hid.h"
+ #include "raw_hid.h"
++#include "usb_descriptor.h"
+ #include "version.h"
+ #include "language.h"
+ #ifdef FACTORY_TEST_ENABLE
+@@ -34,6 +35,8 @@
+ #endif
+ #if defined(LK_WIRELESS_ENABLE) || defined(KC_BLUETOOTH_ENABLE)
+ #    include "wireless.h"
++#    include "transport.h"
++#    include "battery.h"
+ #    ifdef LK_WIRELESS_ENABLE
+ #        include "lkbt51.h"
+ #    else
+@@ -72,6 +75,9 @@ void get_support_feature(uint8_t *data) {
+         ;
+ 
+     data[2] = (FEATURE_QUICK_START | FEATURE_NKRO) >> 8;
++#    if defined(LK_WIRELESS_ENABLE) || defined(KC_BLUETOOTH_ENABLE)
++    data[2] |= (FEATURE_BATTERY >> 8);
++#    endif
+ }
+ 
+ #    ifdef ANANLOG_MATRIX
+@@ -128,6 +134,35 @@ void kc_raw_hid_send(uint8_t src, uint8_t *data, uint8_t len) {
+ #    endif
+ }
+ 
++#    if defined(LK_WIRELESS_ENABLE) || defined(KC_BLUETOOTH_ENABLE)
++/* Proactively push the battery state to the host over the wireless link.
++ * The host only needs to READ the dongle's raw HID interface: the dongle does not bridge
++ * host -> keyboard raw HID, so a pull-only design cannot work over 2.4 GHz. */
++#        ifdef WAKEY_CONFIG_ENABLE
++/* The dongle cannot carry a host -> keyboard request, so the board's own settings ride along with the
++ * push instead: the host reads them without ever sending anything. Weak so other boards are untouched. */
++__attribute__((weak)) uint16_t wakey_idle_timeout_push(void) { return 0; }
++#        endif
++
++void kc_battery_push(void) {
++    uint8_t  data[RAW_EPSIZE] = {0};
++    uint16_t bat_voltage      = battery_get_voltage();
++    data[0]                   = KC_GET_BATTERY;
++    data[1]                   = battery_get_percentage();
++    data[2]                   = bat_voltage & 0xFF;
++    data[3]                   = (bat_voltage >> 8) & 0xFF;
++    data[4]                   = battery_get_charging_state();
++    data[5]                   = get_transport();
++#        ifdef WAKEY_CONFIG_ENABLE
++    uint16_t idle = wakey_idle_timeout_push();
++    data[6]       = idle & 0xFF;
++    data[7]       = (idle >> 8) & 0xFF;
++    data[8]       = 1; /* marker: the setting field is present, so 0 can mean "never" */
++#        endif
++    kc_raw_hid_send(!RAW_HID_SRC_USB, data, RAW_EPSIZE);
++}
++#    endif
++
+ bool kc_raw_hid_rx(uint8_t src, uint8_t *data, uint8_t length) {
+ #    if defined(ANANLOG_MATRIX) && defined(VIA_ENABLE)
+     if (src == RAW_HID_SRC_USB && data[0] == id_get_keyboard_value && data[1] == id_switch_matrix_state) {
+@@ -168,6 +203,24 @@ bool kc_raw_hid_rx(uint8_t src, uint8_t *data, uint8_t length) {
+             data[2] = get_highest_layer(layer_state);
+             break;
+ 
++#    if defined(LK_WIRELESS_ENABLE) || defined(KC_BLUETOOTH_ENABLE)
++        case KC_GET_BATTERY: {
++            uint16_t bat_voltage = battery_get_voltage();
++            data[1]              = battery_get_percentage();
++            data[2]              = bat_voltage & 0xFF;
++            data[3]              = (bat_voltage >> 8) & 0xFF;
++            data[4]              = battery_get_charging_state();
++            data[5]              = get_transport();
++        } break;
++#    endif
++
++#    ifdef WAKEY_CONFIG_ENABLE
++        case KC_WAKEY_CONFIG: {
++            extern void wakey_config_command(uint8_t * data);
++            wakey_config_command(data);
++        } break;
++#    endif
++
+         case KC_MISC_CMD_GROUP:
+             switch (data[1]) {
+                 case MISC_GET_PROTOCOL_VER:
+diff --git a/keyboards/keychron/common/keychron_raw_hid.h b/keyboards/keychron/common/keychron_raw_hid.h
+index e10f659..853bfe7 100644
+--- a/keyboards/keychron/common/keychron_raw_hid.h
++++ b/keyboards/keychron/common/keychron_raw_hid.h
+@@ -25,6 +25,8 @@ enum {
+     KC_GET_FIRMWARE_VERSION = 0xA1,
+     KC_GET_SUPPORT_FEATURE  = 0xA2,
+     KC_GET_DEFAULT_LAYER    = 0xA3,
++    KC_GET_BATTERY          = 0xA4,
++    KC_WAKEY_CONFIG         = 0xA5,
+     KC_MISC_CMD_GROUP       = 0xA7,
+     KC_KEYCHRON_RGB         = 0xA8,
+     KC_ANALOG_MATRIX        = 0xA9,
+@@ -45,6 +47,7 @@ enum {
+     // Byte 1
+     FEATURE_QUICK_START         = 0x01U << 8,
+     FEATURE_NKRO                = 0x01U << 9,
++    FEATURE_BATTERY             = 0x01U << 10,
+ };
+ 
+ enum {
+@@ -86,3 +89,7 @@ enum {
+ };
+ 
+ void kc_raw_hid_send(uint8_t src, uint8_t *data, uint8_t len);
++
++#if defined(LK_WIRELESS_ENABLE) || defined(KC_BLUETOOTH_ENABLE)
++void kc_battery_push(void);
++#endif
+diff --git a/keyboards/keychron/common/wireless/battery.c b/keyboards/keychron/common/wireless/battery.c
+index edc99b6..0030fce 100644
+--- a/keyboards/keychron/common/wireless/battery.c
++++ b/keyboards/keychron/common/wireless/battery.c
+@@ -158,6 +158,18 @@ uint8_t battery_get_percentage(void) {
+         return 0;
+ }
+ 
++uint8_t battery_get_charging_state(void) {
++#if defined(BAT_CHARGING_PIN)
++    if (usb_power_connected()) {
++        if (gpio_read_pin(BAT_CHARGING_PIN) == BAT_CHARGING_LEVEL)
++            return BAT_CHARGING;
++        else
++            return BAT_FULL_CHARGED;
++    }
++#endif
++    return BAT_NOT_CHARGING;
++}
++
+ bool battery_is_empty(void) {
+     return bat_empty > BATTERY_EMPTY_COUNT;
+ }
+diff --git a/keyboards/keychron/common/wireless/battery.h b/keyboards/keychron/common/wireless/battery.h
+index b2c572e..685be13 100644
+--- a/keyboards/keychron/common/wireless/battery.h
++++ b/keyboards/keychron/common/wireless/battery.h
+@@ -55,6 +55,7 @@ void     battery_calculate_voltage(bool vol_src_bt, uint16_t value);
+ void     battery_set_voltage(uint16_t value);
+ uint16_t battery_get_voltage(void);
+ uint8_t  battery_get_percentage(void);
++uint8_t  battery_get_charging_state(void);
+ bool     battery_is_empty(void);
+ bool     battery_is_critical_low(void);
+ bool     battery_power_on_sample(void);
+diff --git a/keyboards/keychron/k5_max/ansi/rgb/keymaps/keychron/keymap.c b/keyboards/keychron/k5_max/ansi/rgb/keymaps/keychron/keymap.c
+index f19aeb0..b162ffc 100644
+--- a/keyboards/keychron/k5_max/ansi/rgb/keymaps/keychron/keymap.c
++++ b/keyboards/keychron/k5_max/ansi/rgb/keymaps/keychron/keymap.c
+@@ -24,13 +24,18 @@ enum layers {
+     WIN_FN,
+ };
+ 
++/* Wakey: Fn+Y cycles the LED idle timeout. Lit keys show the value: 6 = 90 s, 4 = 60 s,
++ * 2 = 30 s, 1 = 15 s. Stored in EEPROM, so it survives power-off and governs the 2.4 GHz
++ * behaviour, where the host cannot reach the keyboard. */
++enum { WK_IDLE = SAFE_RANGE };
++
+ #define FN_MAC MO(MAC_FN)
+ #define FN_WIN MO(WIN_FN)
+ 
+ // clang-format off
+ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
+     [MAC_BASE] = LAYOUT_108_ansi(
+-        KC_ESC,             KC_BRID,  KC_BRIU,  KC_MCTRL, KC_LNPAD, UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT,  KC_MUTE,  KC_VOLD,  KC_VOLU,  KC_SNAP,  KC_SIRI,  UG_NEXT,  KC_F13,   KC_F14,   KC_F15,   KC_F16,
++        KC_ESC,             KC_BRID,  KC_BRIU,  KC_MCTRL, KC_LNPAD, UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT,  KC_MUTE,  KC_VOLD,  KC_VOLU,  KC_SNAP,  KC_F17,   UG_NEXT,  KC_F13,   KC_F14,   KC_F15,   KC_F16,
+         KC_GRV,   KC_1,     KC_2,     KC_3,     KC_4,     KC_5,     KC_6,     KC_7,     KC_8,     KC_9,     KC_0,     KC_MINS,  KC_EQL,   KC_BSPC,  KC_INS,   KC_HOME,  KC_PGUP,  KC_NUM,   KC_PSLS,  KC_PAST,  KC_PMNS,
+         KC_TAB,   KC_Q,     KC_W,     KC_E,     KC_R,     KC_T,     KC_Y,     KC_U,     KC_I,     KC_O,     KC_P,     KC_LBRC,  KC_RBRC,  KC_BSLS,  KC_DEL,   KC_END,   KC_PGDN,  KC_P7,    KC_P8,    KC_P9,
+         KC_CAPS,  KC_A,     KC_S,     KC_D,     KC_F,     KC_G,     KC_H,     KC_J,     KC_K,     KC_L,     KC_SCLN,  KC_QUOT,            KC_ENT,                                 KC_P4,    KC_P5,    KC_P6,    KC_PPLS,
+@@ -40,13 +45,13 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
+     [MAC_FN] = LAYOUT_108_ansi(
+         _______,            KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   _______,  _______,  UG_TOGG,  _______,  _______,  _______,  _______,
+         _______,  BT_HST1,  BT_HST2,  BT_HST3,  P2P4G,    _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,
+-        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,
++        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  WK_IDLE,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,
+         _______,  UG_PREV,  UG_VALD,  UG_HUED,  UG_SATD,  UG_SPDD,  _______,  _______,  _______,  _______,  _______,  _______,            _______,                                _______,  _______,  _______,  _______,
+         _______,            _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,            _______,            _______,  _______,  _______,
+         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            _______,  _______),
+ 
+     [WIN_BASE] = LAYOUT_108_ansi(
+-        KC_ESC,             KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   KC_PSCR,  KC_CTANA, UG_NEXT,  _______,  _______,  _______,  _______,
++        KC_ESC,             KC_F1,    KC_F2,    KC_F3,    KC_F4,    KC_F5,    KC_F6,    KC_F7,    KC_F8,    KC_F9,    KC_F10,   KC_F11,   KC_F12,   KC_PSCR,  KC_F17,   UG_NEXT,  _______,  _______,  _______,  _______,
+         KC_GRV,   KC_1,     KC_2,     KC_3,     KC_4,     KC_5,     KC_6,     KC_7,     KC_8,     KC_9,     KC_0,     KC_MINS,  KC_EQL,   KC_BSPC,  KC_INS,   KC_HOME,  KC_PGUP,  KC_NUM,   KC_PSLS,  KC_PAST,  KC_PMNS,
+         KC_TAB,   KC_Q,     KC_W,     KC_E,     KC_R,     KC_T,     KC_Y,     KC_U,     KC_I,     KC_O,     KC_P,     KC_LBRC,  KC_RBRC,  KC_BSLS,  KC_DEL,   KC_END,   KC_PGDN,  KC_P7,    KC_P8,    KC_P9,
+         KC_CAPS,  KC_A,     KC_S,     KC_D,     KC_F,     KC_G,     KC_H,     KC_J,     KC_K,     KC_L,     KC_SCLN,  KC_QUOT,            KC_ENT,                                 KC_P4,    KC_P5,    KC_P6,    KC_PPLS,
+@@ -56,8 +61,32 @@ const uint16_t PROGMEM keymaps[][MATRIX_ROWS][MATRIX_COLS] = {
+     [WIN_FN] = LAYOUT_108_ansi(
+         _______,            KC_BRID,  KC_BRIU,  KC_TASK,  KC_FILE,  UG_VALD,  UG_VALU,  KC_MPRV,  KC_MPLY,  KC_MNXT,  KC_MUTE,  KC_VOLD,  KC_VOLU,  _______,  _______,  UG_TOGG,  _______,  _______,  _______,  _______,
+         _______,  BT_HST1,  BT_HST2,  BT_HST3,  P2P4G,    _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,
+-        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,
++        UG_TOGG,  UG_NEXT,  UG_VALU,  UG_HUEU,  UG_SATU,  UG_SPDU,  WK_IDLE,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,
+         _______,  UG_PREV,  UG_VALD,  UG_HUED,  UG_SATD,  UG_SPDD,  _______,  _______,  _______,  _______,  _______,  _______,            _______,                                _______,  _______,  _______,  _______,
+         _______,            _______,  _______,  _______,  _______,  BAT_LVL,  _______,  _______,  _______,  _______,  _______,            _______,            _______,            _______,  _______,  _______,
+         _______,  _______,  _______,                                _______,                                _______,  _______,  _______,  _______,  _______,  _______,  _______,  _______,            _______,  _______),
+ };
++
++/* Wakey: Fn+Y handler and the LED indicator that shows the selected timeout. */
++bool process_record_user(uint16_t keycode, keyrecord_t *record) {
++    /* Every key event feeds the idle clock, so the LED timeout only counts real inactivity. */
++    extern void wakey_note_activity(uint16_t keycode);
++    wakey_note_activity(keycode);
++
++    if (keycode == WK_IDLE) {
++        if (record->event.pressed) {
++            extern void wakey_cycle_idle_timeout(void);
++            wakey_cycle_idle_timeout();
++        }
++        return false;
++    }
++    return true;
++}
++
++#ifdef RGB_MATRIX_ENABLE
++bool rgb_matrix_indicators_user(void) {
++    extern void wakey_indicator_draw(void);
++    wakey_indicator_draw();
++    return true;
++}
++#endif
+diff --git a/keyboards/keychron/k5_max/config.h b/keyboards/keychron/k5_max/config.h
+index 2084534..59604b6 100644
+--- a/keyboards/keychron/k5_max/config.h
++++ b/keyboards/keychron/k5_max/config.h
+@@ -15,6 +15,10 @@
+  */
+ 
+ #pragma once
++
++/* Wakey: an EEPROM-backed setting (LED idle timeout) plus a raw-HID command to read/write it.
++ * Uses QMK's user-data block, which is separate from Keychron's custom-RGB region. */
++#define WAKEY_CONFIG_ENABLE
+ #include "eeconfig_kb.h"
+ 
+ /* SPI configuration */
+diff --git a/keyboards/keychron/k5_max/k5_max.c b/keyboards/keychron/k5_max/k5_max.c
+index 20d41ca..1a76b95 100644
+--- a/keyboards/keychron/k5_max/k5_max.c
++++ b/keyboards/keychron/k5_max/k5_max.c
+@@ -15,10 +15,142 @@
+  */
+ 
+ #include "keychron.h"
++#ifdef LK_WIRELESS_ENABLE
++#    include "keychron_raw_hid.h"
++#    include "raw_hid.h"
++#    include "usb_descriptor.h"
++#endif
+ 
+ #define POWER_ON_LED_DURATION 3000
+ static uint32_t power_on_indicator_timer;
+ 
++#ifdef LK_WIRELESS_ENABLE
++#    ifndef BATTERY_PUSH_INTERVAL
++#        define BATTERY_PUSH_INTERVAL 2000
++#    endif
++static uint32_t battery_push_timer = 0;
++#endif
++
++#ifndef WAKEY_IDLE_DEFAULT_SECONDS
++#    define WAKEY_IDLE_DEFAULT_SECONDS 60   /* 0 = never turn the LEDs off */
++#endif
++#define WAKEY_CONFIG_MAGIC 0x5741           /* "WA" */
++
++/* Stored in QMK's legacy 32-bit user value: high half is a magic tag, low half the seconds.
++ *
++ * The user *datablock* (EECONFIG_USER_DATA_SIZE) is deliberately NOT used. Reserving it shifts every
++ * EEPROM offset after it — including Keychron's custom-RGB and wireless config regions — which
++ * corrupts their contents. This value lives in a fixed, pre-existing slot. */
++static uint16_t wakey_idle_seconds = WAKEY_IDLE_DEFAULT_SECONDS;
++
++static void wakey_config_load(void) {
++    uint32_t stored = eeconfig_read_user();
++    if ((stored >> 16) == WAKEY_CONFIG_MAGIC) wakey_idle_seconds = stored & 0xFFFF;
++}
++
++static void wakey_config_save(void) {
++    eeconfig_update_user(((uint32_t)WAKEY_CONFIG_MAGIC << 16) | (wakey_idle_seconds & 0xFFFF));
++}
++
++/* Raw-HID 0xA5: 0x01 get, 0x02 set. Status in data[2] (set here), payload from data[3]. */
++void wakey_config_command(uint8_t *data) {
++    switch (data[1]) {
++        case 0x01:
++            data[3] = wakey_idle_seconds & 0xFF;
++            data[4] = (wakey_idle_seconds >> 8) & 0xFF;
++            break;
++
++        case 0x02: {
++            uint16_t seconds = (uint16_t)data[3] | ((uint16_t)data[4] << 8);
++            if (seconds > 3600) seconds = 3600;
++            wakey_idle_seconds = seconds;
++            wakey_config_save();
++            break;
++        }
++
++        default:
++            data[2] = 1; /* failure */
++            return;
++    }
++    data[2] = 0; /* success */
++}
++
++/* ---- Fn+Y: cycle the LED idle timeout, showing the value on the number row ------------------ */
++typedef struct {
++    uint16_t seconds;
++    uint8_t  row_a, col_a; /* first digit key, e.g. "9" of 90 */
++    uint8_t  row_b, col_b; /* second digit key, e.g. "0" of 90 */
++} wakey_step_t;
++
++/* Number row is matrix row 1; columns 1..10 are the keys 1,2,3,4,5,6,7,8,9,0. */
++static const wakey_step_t wakey_steps[] = {
++    {90, 1, 9, 1, 10},
++    {60, 1, 6, 1, 10},
++    {30, 1, 3, 1, 10},
++    {15, 1, 1, 1, 5},
++};
++
++static uint32_t wakey_indicator_until = 0;
++/* Our own "last keypress" clock. `last_input_activity_elapsed()` cannot be used: Keychron's indicator
++ * code calls rgb_matrix_disable_time_reset() (which resets that very timestamp) on wireless events,
++ * so after the first sleep/wake cycle the board looks permanently active. */
++static uint32_t wakey_last_key_time = 0;
++static bool     wakey_idle_leds_off  = false;
++
++void wakey_note_activity(uint16_t keycode) {
++    (void)keycode;
++    wakey_last_key_time = timer_read32();
++}
++
++static const wakey_step_t *wakey_current_step(void) {
++    for (uint8_t i = 0; i < ARRAY_SIZE(wakey_steps); i++) {
++        if (wakey_steps[i].seconds == wakey_idle_seconds) return &wakey_steps[i];
++    }
++    return NULL;
++}
++
++void wakey_cycle_idle_timeout(void) {
++    uint8_t next = 0;
++    for (uint8_t i = 0; i < ARRAY_SIZE(wakey_steps); i++) {
++        if (wakey_steps[i].seconds == wakey_idle_seconds) {
++            next = (i + 1) % ARRAY_SIZE(wakey_steps);
++            break;
++        }
++    }
++
++    wakey_idle_seconds = wakey_steps[next].seconds;
++    wakey_config_save();
++    wakey_indicator_until = timer_read32() + 2500;
++}
++
++/* Strong override of the weak hook in keychron_raw_hid.c: ships the timeout with the battery push. */
++uint16_t wakey_idle_timeout_push(void) { return wakey_idle_seconds; }
++
++bool wakey_indicator_active(void) {
++    return wakey_indicator_until != 0 && timer_read32() < wakey_indicator_until;
++}
++
++/* Lights the two digits of the current timeout, e.g. "9" and "0" while 90 s is selected. */
++void wakey_indicator_draw(void) {
++    if (!wakey_indicator_active()) return;
++
++    const wakey_step_t *step = wakey_current_step();
++    if (step == NULL) return;
++
++    /* Dim the whole board first, so the two digits are unmistakable. */
++    for (uint8_t i = 0; i < RGB_MATRIX_LED_COUNT; i++) {
++        rgb_matrix_set_color(i, 0, 0, 8);
++    }
++
++    uint8_t led = 0;
++    if (rgb_matrix_map_row_column_to_led(step->row_a, step->col_a, &led)) {
++        rgb_matrix_set_color(led, 0, 255, 0);
++    }
++    if (rgb_matrix_map_row_column_to_led(step->row_b, step->col_b, &led)) {
++        rgb_matrix_set_color(led, 0, 255, 0);
++    }
++}
++
+ #if defined(LK_WIRELESS_ENABLE)
+ pin_t bt_led_pins[] = BT_INDICATION_LED_PIN_LIST;
+ #endif
+@@ -32,8 +164,49 @@ bool dip_switch_update_kb(uint8_t index, bool active) {
+     return true;
+ }
+ 
++/* The wireless module suspends itself when the host goes quiet, and the MCU then sleeps, so the
++ * timer-based dim below can lose the race and never run — leaving 108 LEDs lit all night. Turning the
++ * matrix off on the suspend hook (and back on at reconnect) makes the power saving independent of
++ * that race. */
++void wireless_enter_sleep_kb(void) {
++#ifdef RGB_MATRIX_ENABLE
++    if (rgb_matrix_is_enabled()) {
++        rgb_matrix_disable_noeeprom();
++        wakey_idle_leds_off = true;
++    }
++#endif
++}
++
++/* Last chance before Keychron stops SPI: once lpm_enter_low_power() runs, nothing we do can reach
++ * the LED driver, and the LEDs are simply frozen in their current (lit) state. Shutting the driver
++ * down here is a hardware "all off" that survives the SPI stop. */
++void lpm_pre_enter_low_power(void) {
++#ifdef RGB_MATRIX_ENABLE
++#    ifdef RGB_MATRIX_DRIVER_SHUTDOWN_ENABLE
++    if (!rgb_matrix_is_driver_shutdown()) {
++        rgb_matrix_driver_shutdown();
++    }
++#    endif
++    wakey_idle_leds_off = true;
++#endif
++}
++
++void wireless_enter_connected_kb(uint8_t host_idx) {
++    (void)host_idx;
++#ifdef RGB_MATRIX_ENABLE
++    if (wakey_idle_leds_off) {
++        rgb_matrix_enable_noeeprom();
++        wakey_idle_leds_off = false;
++    }
++#endif
++    /* Deliberately does NOT touch wakey_last_key_time: this hook fires on every (re)connect, so
++     * resetting the idle clock here kept postponing the timeout indefinitely after a wake. */
++}
++
+ void keyboard_post_init_kb(void) {
+     keychron_common_init();
++    wakey_config_load();
++    wakey_last_key_time = timer_read32();
+     keyboard_post_init_user();
+     power_on_indicator_timer = timer_read32();
+ }
+@@ -63,6 +236,46 @@ void keychron_task_kb(void) {
+ #endif
+         }
+     }
++
++#ifdef RGB_MATRIX_ENABLE
++    /* Battery saving: 108 RGB LEDs dominate the power draw on a wireless board.
++     *
++     * The built-in RGB_MATRIX_TIMEOUT cannot be used here: Keychron's indicator code re-arms it to
++     * RGB_MATRIX_TIMEOUT_INFINITE every time the link connects (indicator.c, DECIDE_TIME with
++     * indicator_config.duration == 0), so a configured idle timeout is repeatedly overwritten.
++     * Driving the matrix directly is immune to that, and never touches the user's Fn+Tab setting:
++     * we only switch off what we switched on. */
++    const bool     should_dim = get_transport() != TRANSPORT_USB && wakey_idle_seconds > 0;
++    const uint32_t since_key  = timer_elapsed32(wakey_last_key_time);
++    const bool     want_off   = should_dim && since_key > (uint32_t)wakey_idle_seconds * 1000U;
++
++    /* Deliberately not "act once, then wait to be told we were woken":
++     *
++     * The previous version cleared its flag only inside a 500 ms window after a keypress. If the MCU
++     * was asleep and only resumed tasks later than that, the flag stayed set forever and the board
++     * never dimmed again — which is exactly the reported "works once" behaviour. Deciding from
++     * `want_off` every tick has no window at all: the moment the clock is below the timeout the flag
++     * clears, and the moment it passes the timeout it dims again. */
++    if (want_off) {
++        if (!wakey_idle_leds_off && rgb_matrix_is_enabled()) {
++            rgb_matrix_disable_noeeprom();
++            wakey_idle_leds_off = true;
++        }
++    } else if (wakey_idle_leds_off) {
++        rgb_matrix_enable_noeeprom();
++        wakey_idle_leds_off = false;
++    }
++#endif
++
++#ifdef LK_WIRELESS_ENABLE
++    /* Push the battery state to the host over the wireless link (PUSH model). */
++    if (timer_elapsed32(battery_push_timer) > BATTERY_PUSH_INTERVAL) {
++        battery_push_timer = timer_read32();
++        if ((get_transport() & TRANSPORT_WIRELESS) && wireless_get_state() == WT_CONNECTED) {
++            kc_battery_push();
++        }
++    }
++#endif
+ }
+ 
+ #ifdef LK_WIRELESS_ENABLE

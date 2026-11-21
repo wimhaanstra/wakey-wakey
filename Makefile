@@ -5,13 +5,25 @@ ICON   := Resources/AppIcon.icns
 SRC    := $(wildcard Sources/Wakey/*.swift)
 MODCACHE := .cache/modules
 
+# A stable signing identity keeps the Accessibility grant (TV media keys and macro keys) across
+# rebuilds. Fall back to ad-hoc on machines without an Apple Development certificate; in that case
+# macOS ties the grant to the binary and it has to be re-enabled after every rebuild.
+SIGN_IDENTITY ?= $(shell security find-identity -v -p codesigning 2>/dev/null \
+	| sed -n 's/.*"\(.*\)"/\1/p' \
+	| grep -E '^(Apple Development|Developer ID Application):' \
+	| head -1)
+SIGN_ARG := $(if $(SIGN_IDENTITY),"$(SIGN_IDENTITY)",-)
+
 # Note: we drive swiftc directly rather than `swift build`. SwiftPM's build system
 # needs to write outside the workspace (and uses sandbox-exec), which is blocked in
 # sandboxed environments. Package.swift is kept for opening the project in Xcode.
-.PHONY: app run clean status icon install
+.PHONY: app install run clean status icon
 
+# There is deliberately no compile-only target: every build also refreshes the installed copy.
 app: $(BIN) $(APP)/Contents/Resources/AppIcon.icns
-	@echo "built $(APP) — launch with: open $(APP)"
+	@rm -rf /Applications/$(APP)
+	@cp -R $(APP) /Applications/
+	@echo "built and installed $(APP) — /Applications/$(APP) is current"
 
 $(BIN): $(SRC) $(PLIST) Makefile
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources $(MODCACHE)
@@ -19,7 +31,7 @@ $(BIN): $(SRC) $(PLIST) Makefile
 		-module-cache-path $(MODCACHE) \
 		-o $(BIN) $(SRC)
 	cp $(PLIST) $(APP)/Contents/Info.plist
-	codesign --force --sign - --identifier nl.sortedbits.wakey $(APP)
+	codesign --force --sign $(SIGN_ARG) --identifier nl.sortedbits.wakey $(APP)
 
 $(APP)/Contents/Resources/AppIcon.icns: $(ICON)
 	mkdir -p $(APP)/Contents/Resources
@@ -33,19 +45,16 @@ $(ICON): tools/make-icon.swift
 	@staging=$$(mktemp -d)/AppIcon.icns; \
 	iconutil -c icns Resources/AppIcon.iconset -o "$$staging" && cp "$$staging" $(ICON)
 
+install: app
+
 run: app
-	open $(APP)
+	open /Applications/$(APP)
 
 status: app
 	$(BIN) --status
 
 selftest: app
 	$(BIN) --selftest
-
-install: app
-	rm -rf /Applications/$(APP)
-	cp -R $(APP) /Applications/
-	@echo "installed /Applications/$(APP) — open it from there, then enable 'Start Wakey at login'"
 
 clean:
 	rm -rf $(APP) .cache Resources/AppIcon.iconset

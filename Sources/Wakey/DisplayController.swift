@@ -21,6 +21,11 @@ final class DisplayController {
 
     private(set) var blankedByUs = false
 
+    /// Called after a blank/wake so the TV can follow the displays without DisplayController
+    /// knowing anything about webOS.
+    var onBlank: (() -> Void)?
+    var onWake: (() -> Void)?
+
     /// Ground truth, independent of our own bookkeeping.
     var displaysAreAsleep: Bool { CGDisplayIsAsleep(CGMainDisplayID()) != 0 }
 
@@ -31,6 +36,7 @@ final class DisplayController {
             log("blank: displays already asleep, nothing to do")
             blankedByUs = true
             if keepSystemAwake { holdAssertions() }
+            onBlank?()
             return
         }
 
@@ -47,6 +53,7 @@ final class DisplayController {
         blankedByUs = true
         log("blank: pmset displaysleepnow ok (asleep=\(displaysAreAsleep))")
         if keepSystemAwake { holdAssertions() }
+        onBlank?()
     }
 
     // MARK: - wake
@@ -71,12 +78,14 @@ final class DisplayController {
         }
 
         blankedByUs = false
+        onWake?()
     }
 
     /// The screens came back on their own (user input). Drop our assertions and forget our claim.
     func noteExternallyWoken() {
         releaseAssertions()
         blankedByUs = false
+        onWake?()
     }
 
     // MARK: - assertions
